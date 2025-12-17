@@ -451,7 +451,7 @@ lint = [
 requires-dist = [
     { name = "anyio", marker = "extra == 'dev'", specifier = ">=4.4" },
     { name = "html2image", specifier = ">=2.0.4.3" },
-    { name = "leanclient", specifier = "==0.6.1" },
+    { name = "leanclient", git = "https://github.com/alok/leanclient.git?rev=feat%2Fwidget-support" },
     { name = "mcp", extras = ["cli"], specifier = "==1.23.1" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.22.0" },
     { name = "orjson", specifier = ">=3.11.1" },
@@ -465,14 +465,10 @@ provides-extras = ["lint", "dev"]
 [[package]]
 name = "leanclient"
 version = "0.6.1"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/alok/leanclient.git?rev=feat%2Fwidget-support#55459423ae4bffe14cbf7589e00e6efa4f85fa07" }
 dependencies = [
     { name = "orjson" },
     { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/31/51/4c7f50d58c908559d3a9a9e50d1ca9c87a70849afee2803cf3491bc1af9a/leanclient-0.6.1.tar.gz", hash = "sha256:7201e9298216dcb095cd627f0acc473d8afa88be186f3a4307051ff87286bcc0", size = 1121477, upload-time = "2025-12-03T07:50:10.928Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5e/97/8fcd107dabbf30d03221d767fc9fce8d036cb90ca1bd12dbdf50ca175b98/leanclient-0.6.1-py3-none-any.whl", hash = "sha256:28703bf908774a8f17af2af2b4622c678c3e70122aad34e575b4050ad2959a7e", size = 35189, upload-time = "2025-12-03T07:50:08.51Z" },
 ]
 
 [[package]]
