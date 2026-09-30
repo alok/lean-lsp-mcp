@@ -18,7 +18,7 @@ from lean_lsp_mcp.utils import LeanToolError
 
 
 async def safe_report_progress(
-    ctx: Any, *, progress: int, total: int, message: str
+    ctx: Any, *, progress: int, total: int | None, message: str
 ) -> None:
     try:
         await ctx.report_progress(progress=progress, total=total, message=message)

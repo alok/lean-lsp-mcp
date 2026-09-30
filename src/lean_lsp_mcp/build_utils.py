@@ -70,6 +70,15 @@ class LakeBuildRunner:
     log_lines: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     active_process: asyncio.subprocess.Process | None = None
+    _progress: int = 0
+
+    async def report_progress(self, message: str) -> None:
+        # Lake can repeat/reset its counts and discover more jobs between phases.
+        # Count notifications across the whole request, keeping Lake counts in text.
+        self._progress += 1
+        await safe_report_progress(
+            self.ctx, progress=self._progress, total=None, message=message
+        )
 
     async def _handle_line(self, line: str) -> None:
         line = line.rstrip()
@@ -83,11 +92,8 @@ class LakeBuildRunner:
         if match := re.search(
             r"\[(\d+)/(\d+)\]\s*(.+?)(?:\s+\(\d+\.?\d*[ms]+\))?$", line
         ):
-            await safe_report_progress(
-                self.ctx,
-                progress=int(match.group(1)),
-                total=int(match.group(2)),
-                message=match.group(3) or "Building",
+            await self.report_progress(
+                f"[{match.group(1)}/{match.group(2)}] {match.group(3)}"
             )
 
     async def run(self, *args: str, cwd: Path) -> asyncio.subprocess.Process:
@@ -159,15 +165,11 @@ async def run_build(
         await _stop_project_clients(ctx, project_path)
 
         if clean:
-            await safe_report_progress(
-                ctx, progress=1, total=16, message="Running `lake clean`"
-            )
+            await runner.report_progress("Running `lake clean`")
             await runner.run("lake", "clean", cwd=project_path)
 
         if fetch_cache:
-            await safe_report_progress(
-                ctx, progress=2, total=16, message="Running `lake exe cache get`"
-            )
+            await runner.report_progress("Running `lake exe cache get`")
             await runner.run("lake", "exe", "cache", "get", cwd=project_path)
 
         process = await runner.run("lake", "build", cwd=project_path)

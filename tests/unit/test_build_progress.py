@@ -85,7 +85,7 @@ def patch_build():
 
 @pytest.mark.asyncio
 async def test_progress_parsing(build_mocks, patch_build, tmp_path):
-    """Progress markers [n/m] are parsed and reported."""
+    """Lake counts remain visible while request progress strictly increases."""
     project, ctx, _cache_proc, build_proc = build_mocks
     progress_calls = []
     ctx.report_progress = AsyncMock(
@@ -95,17 +95,92 @@ async def test_progress_parsing(build_mocks, patch_build, tmp_path):
     )
 
     build_proc.stdout.read = make_read(
-        b"[0/8] Ran job\n[1/8] Built A\n[2/10] Built B\n"
+        b"[0/8] Ran job\n[1/8] Built A\n[1/8] Built A\n"
+        b"[2/10] Built B\n[0/2] Ran new phase\n"
     )
     patch_build.side_effect = [build_proc]
 
     await lsp_build(ctx, lean_project_path=str(project))
 
-    # Check build progress calls (exclude setup phases)
-    build_progress = [
-        (p, t) for p, t, m in progress_calls if "Built" in m or "Ran" in m
+    assert [p for p, _, _ in progress_calls] == [1, 2, 3, 4, 5]
+    assert all(t is None for _, t, _ in progress_calls)
+    assert [m for _, _, m in progress_calls] == [
+        "[0/8] Ran job",
+        "[1/8] Built A",
+        "[1/8] Built A",
+        "[2/10] Built B",
+        "[0/2] Ran new phase",
     ]
-    assert build_progress == [(0, 8), (1, 8), (2, 10)]
+
+
+@pytest.mark.parametrize("clean", [False, True])
+@pytest.mark.parametrize("fetch_cache", [False, True])
+async def test_progress_spans_all_commands(
+    build_mocks, patch_build, clean, fetch_cache
+):
+    project, ctx, _, build_proc = build_mocks
+    processes = []
+    for enabled in (clean, fetch_cache):
+        if enabled:
+            process = MagicMock()
+            process.stdout.read = make_read(b"[0/2] Ran setup\n[1/2] Built setup\n")
+            process.wait = AsyncMock()
+            processes.append(process)
+    build_proc.stdout.read = make_read(b"[0/10] Ran build\n[1/12] Built module\n")
+    processes.append(build_proc)
+    patch_build.side_effect = processes
+
+    result = await lsp_build(
+        ctx, lean_project_path=str(project), clean=clean, fetch_cache=fetch_cache
+    )
+
+    calls = ctx.report_progress.await_args_list
+    assert result.success
+    assert [call.kwargs["progress"] for call in calls] == list(range(1, len(calls) + 1))
+    assert all(call.kwargs["total"] is None for call in calls)
+    assert "[1/12] Built module" in result.output
+
+
+async def test_notification_failure_does_not_abort_build(build_mocks, patch_build):
+    project, ctx, _, build_proc = build_mocks
+    ctx.report_progress.side_effect = RuntimeError("notification unavailable")
+    build_proc.stdout.read = make_read(b"[0/2] Built A\n[0/1] Built B\n")
+    patch_build.side_effect = [build_proc]
+
+    result = await lsp_build(ctx, lean_project_path=str(project))
+
+    assert result.success
+    assert [
+        call.kwargs["progress"] for call in ctx.report_progress.await_args_list
+    ] == [1, 2]
+
+
+async def test_failed_build_preserves_progress_and_errors(build_mocks, patch_build):
+    project, ctx, _, build_proc = build_mocks
+    build_proc.returncode = 1
+    build_proc.stdout.read = make_read(b"[0/2] Built A\nerror: failed B\n")
+    patch_build.side_effect = [build_proc]
+
+    result = await lsp_build(ctx, lean_project_path=str(project))
+
+    assert not result.success
+    assert result.errors == ["error: failed B"]
+    assert ctx.report_progress.await_args.kwargs["progress"] == 1
+
+
+async def test_cancellation_during_progress_stops_build(build_mocks, patch_build):
+    project, ctx, _, build_proc = build_mocks
+    build_proc.returncode = None
+    build_proc.stdout.read = make_read(b"[0/2] Built A\n[1/2] Built B\n")
+    ctx.report_progress.side_effect = asyncio.CancelledError()
+    patch_build.side_effect = [build_proc]
+
+    with pytest.raises(asyncio.CancelledError):
+        await lsp_build(ctx, lean_project_path=str(project))
+
+    build_proc.terminate.assert_called_once()
+    build_proc.wait.assert_awaited_once()
+    assert ctx.report_progress.await_count == 1
 
 
 @pytest.mark.asyncio
