@@ -24,11 +24,60 @@ from lean_lsp_mcp.tool_utils import safe_report_progress
 logger = get_logger(__name__)
 
 
+@dataclass
+class _CoordinatedBuild:
+    task: asyncio.Task[BuildResult]
+    finished: asyncio.Event
+    previous: _CoordinatedBuild | None = None
+    cancel_requested: bool = False
+
+    def cancel(self) -> None:
+        if not self.task.done() and not self.cancel_requested:
+            self.cancel_requested = True
+            self.task.cancel()
+
+
 class BuildCoordinator:
     def __init__(self, mode: str) -> None:
         self.mode = mode
         self._lock = asyncio.Lock()
-        self._current_task: asyncio.Task[BuildResult] | None = None
+        self._current: _CoordinatedBuild | None = None
+        self._waiters: dict[object, _CoordinatedBuild] = {}
+
+    async def _wait_finished(self, build: _CoordinatedBuild) -> None:
+        """Include predecessors of tasks cancelled before they could start."""
+        while True:
+            await build.finished.wait()
+            if not build.task.cancelled():
+                build.task.exception()  # Retrieve failures with no remaining waiter.
+            previous = build.previous
+            if previous is None:
+                return
+            build = previous
+
+    async def _drain(self, build: _CoordinatedBuild) -> None:
+        """Repeated request cancellation must not interrupt build cleanup."""
+        while True:
+            try:
+                await self._wait_finished(build)
+                build.previous = None
+                return
+            except asyncio.CancelledError:
+                continue
+
+    async def _build_after(
+        self,
+        previous: _CoordinatedBuild | None,
+        build_factory: Callable[[], Coroutine[Any, Any, BuildResult]],
+    ) -> BuildResult:
+        if previous is not None:
+            try:
+                await self._wait_finished(previous)
+                previous.previous = None
+            except asyncio.CancelledError:
+                await self._drain(previous)
+                raise
+        return await build_factory()
 
     async def run(
         self, build_factory: Callable[[], Coroutine[Any, Any, BuildResult]]
@@ -36,30 +85,50 @@ class BuildCoordinator:
         if self.mode == "allow":
             return await build_factory()
 
-        async with self._lock:
-            if self._current_task and not self._current_task.done():
-                self._current_task.cancel()
-            self._current_task = asyncio.create_task(build_factory())
-            task = self._current_task
-
+        waiter = object()
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if not task.cancelled():
-                raise
-            if self.mode == "cancel":
-                return BuildResult(
-                    success=False,
-                    output="",
-                    errors=["Build superseded by newer request."],
-                )
+            async with self._lock:
+                previous = self._current
+                if previous is not None:
+                    previous.cancel()
+                task = asyncio.create_task(self._build_after(previous, build_factory))
+                finished = asyncio.Event()
+                task.add_done_callback(lambda _: finished.set())
+                build = _CoordinatedBuild(task, finished, previous)
+                self._current = build
+                if self.mode == "share":
+                    # Earlier requests remain interested in the replacement result.
+                    for existing in self._waiters:
+                        self._waiters[existing] = build
+                self._waiters[waiter] = build
+
             while True:
-                latest = self._current_task
-                try:
-                    return await latest
-                except asyncio.CancelledError:
-                    if self._current_task is latest:
-                        raise
+                # The completion signal never cancels. CancelledError here therefore
+                # belongs to this request, even when its build is also cancelled.
+                await build.finished.wait()
+                if not build.task.cancelled():
+                    return build.task.result()
+                if self.mode == "cancel" and self._current is not build:
+                    return BuildResult(
+                        success=False,
+                        output="",
+                        errors=["Build superseded by newer request."],
+                    )
+                latest = self._waiters[waiter]
+                if latest is build:
+                    raise asyncio.CancelledError
+                build = latest
+        finally:
+            abandoned = None
+            async with self._lock:
+                owned = self._waiters.pop(waiter, None)
+                if owned is not None and all(
+                    candidate is not owned for candidate in self._waiters.values()
+                ):
+                    owned.cancel()
+                    abandoned = owned
+            if abandoned is not None:
+                await self._drain(abandoned)
 
 
 @dataclass
