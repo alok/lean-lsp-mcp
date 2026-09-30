@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,119 @@ import pytest
 from lean_lsp_mcp.models import BuildResult
 from lean_lsp_mcp.server import BuildCoordinator
 from lean_lsp_mcp.build_utils import LakeBuildRunner, run_build
+
+
+async def _wait_pid_gone(pid: int) -> None:
+    for _ in range(200):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail(f"synthetic child {pid} was not reaped")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires owned POSIX process groups")
+@pytest.mark.parametrize("mode", ["cancel", "share"])
+@pytest.mark.parametrize("leader_exits_first", [False, True])
+@pytest.mark.parametrize("detached", [False, True])
+async def test_supersession_cleans_pipe_holding_descendant(
+    mode: str, leader_exits_first: bool, detached: bool, tmp_path: Path
+) -> None:
+    coordinator = BuildCoordinator(mode)
+    runner = LakeBuildRunner(None)
+    ready = asyncio.Event()
+    descendant: int | None = None
+    replacement_started = asyncio.Event()
+    # A detached child is outside the owned group; its pipe must still not block
+    # cleanup. The fixture explicitly kills that child in teardown.
+    program = (
+        "import subprocess,sys,signal,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'], "
+        f"start_new_session={detached!r}); "
+        "print(child.pid,flush=True); "
+        + ("sys.exit(0)" if leader_exits_first else "time.sleep(60)")
+    )
+
+    async def handle(line: str) -> None:
+        nonlocal descendant
+        descendant = int(line)
+        ready.set()
+
+    runner._handle_line = handle
+
+    async def build() -> BuildResult:
+        try:
+            await runner.run(sys.executable, "-c", program, cwd=tmp_path)
+            return BuildResult(success=True, output="first", errors=[])
+        except asyncio.CancelledError:
+            await runner.cancel()
+            raise
+
+    async def replacement() -> BuildResult:
+        assert runner.active_process is not None
+        assert runner.active_process.returncode is not None
+        replacement_started.set()
+        return BuildResult(success=True, output="replacement", errors=[])
+
+    callers = [asyncio.create_task(coordinator.run(build))]
+    process_wait: asyncio.Task[int] | None = None
+    try:
+        await asyncio.wait_for(ready.wait(), 2)
+        assert descendant is not None and runner.active_process is not None
+        process = runner.active_process
+        assert runner._process_group == process.pid
+        assert runner._process_group != os.getpgrp()
+        assert os.getpgid(descendant) == (descendant if detached else process.pid)
+        # A waiter created before the leader exits can require pipe EOF too.
+        process_wait = asyncio.create_task(process.wait())
+        await asyncio.sleep(0)
+        if leader_exits_first:
+            for _ in range(200):
+                if process.returncode is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert process.returncode == 0
+
+        with (
+            patch("lean_lsp_mcp.build_utils._TERMINATE_TIMEOUT", 0.05),
+            patch("lean_lsp_mcp.build_utils._KILL_TIMEOUT", 0.5),
+        ):
+            callers.append(asyncio.create_task(coordinator.run(replacement)))
+            done, pending = await asyncio.wait(callers, timeout=1.5)
+            assert not pending, "pipe-holding descendant blocked supersession"
+            assert len(done) == 2
+        results = await asyncio.gather(*callers)
+        assert replacement_started.is_set()
+        assert results[-1].output == "replacement"
+        assert results[0].success == (mode == "share")
+        assert not coordinator._waiters
+        await asyncio.wait_for(process_wait, 0.5)
+        assert process.stdout is not None
+        await asyncio.sleep(0)
+        assert process.stdout.at_eof()
+        if detached:
+            os.kill(descendant, 0)  # Do not signal a group this runner did not create.
+        else:
+            await _wait_pid_gone(descendant)
+    finally:
+        # Only these exact synthetic child IDs are ever cleaned up by the fixture.
+        if descendant is not None:
+            try:
+                os.kill(descendant, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process = runner.active_process
+        if process is not None and process.returncode is None:
+            process.kill()
+        await asyncio.wait_for(asyncio.gather(*callers, return_exceptions=True), 3)
+        if process_wait is not None:
+            await asyncio.wait_for(process_wait, 3)
+        if process is not None:
+            await _wait_pid_gone(process.pid)
+        if descendant is not None:
+            await _wait_pid_gone(descendant)
 
 
 @pytest.mark.parametrize("mode", ["cancel", "share"])
@@ -286,6 +401,7 @@ async def test_last_caller_cancellation_reaps_direct_process(
                 await processes[0].wait()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX signal return codes")
 async def test_runner_kills_process_that_ignores_termination(tmp_path: Path) -> None:
     runner = LakeBuildRunner(MagicMock())
     process = await asyncio.create_subprocess_exec(
@@ -298,15 +414,10 @@ async def test_runner_kills_process_that_ignores_termination(tmp_path: Path) -> 
     assert process.stdout is not None
     await process.stdout.readline()
     runner.active_process = process
-    wait_for = asyncio.wait_for
-
-    async def short_wait(awaitable, timeout):
-        return await wait_for(awaitable, timeout=0.05)
-
     try:
-        with patch("lean_lsp_mcp.build_utils.asyncio.wait_for", short_wait):
+        with patch("lean_lsp_mcp.build_utils._TERMINATE_TIMEOUT", 0.05):
             await runner.cancel()
-        assert process.returncode == -9
+        assert process.returncode == -signal.SIGKILL
     finally:
         if process.returncode is None:
             process.kill()

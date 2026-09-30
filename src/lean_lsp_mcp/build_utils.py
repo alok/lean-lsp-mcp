@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import signal
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,8 @@ from lean_lsp_mcp.models import BuildResult
 from lean_lsp_mcp.tool_utils import safe_report_progress
 
 logger = get_logger(__name__)
+_TERMINATE_TIMEOUT = 5.0
+_KILL_TIMEOUT = 1.0
 
 
 @dataclass
@@ -133,12 +137,18 @@ class BuildCoordinator:
 
 @dataclass
 class LakeBuildRunner:
-    """Run Lake commands while collecting filtered output and progress."""
+    """Run Lake commands with bounded cancellation cleanup.
+
+    POSIX commands own a new session/process group; cancellation signals that
+    group even after its leader exits. Other platforms terminate the direct
+    child only. Descendants that leave the owned group are not terminated.
+    """
 
     ctx: Any
     log_lines: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     active_process: asyncio.subprocess.Process | None = None
+    _process_group: int | None = None
 
     async def _handle_line(self, line: str) -> None:
         line = line.rstrip()
@@ -165,8 +175,11 @@ class LakeBuildRunner:
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # Only signal a group whose session this runner created.
+            **({"start_new_session": True} if os.name == "posix" else {}),
         )
         self.active_process = process
+        self._process_group = process.pid if os.name == "posix" else None
         assert process.stdout is not None
 
         remainder = ""
@@ -184,16 +197,70 @@ class LakeBuildRunner:
     def output(self, line_count: int) -> str:
         return "\n".join(self.log_lines[-line_count:]) if line_count else ""
 
+    def _signal_process(
+        self, process: asyncio.subprocess.Process, *, kill: bool
+    ) -> None:
+        try:
+            if self._process_group is not None:
+                # The leader may already have exited while descendants retain stdout.
+                os.killpg(
+                    self._process_group, signal.SIGKILL if kill else signal.SIGTERM
+                )
+            elif process.returncode is None:
+                if kill:
+                    process.kill()
+                else:
+                    process.terminate()
+        except ProcessLookupError:
+            pass
+
+    async def _wait_cleanup(self, process: asyncio.subprocess.Process) -> None:
+        await process.wait()
+        if self._process_group is not None:
+            while True:
+                try:
+                    os.killpg(self._process_group, 0)
+                except ProcessLookupError:
+                    return
+                except PermissionError:
+                    # A dying group may be unsignalable before the OS removes it.
+                    # Keep polling within the caller's deadline, never infer exit.
+                    pass
+                await asyncio.sleep(0.05)
+
+    @staticmethod
+    def _close_output_pipe(process: asyncio.subprocess.Process) -> None:
+        # Process exposes no public pipe-close API. Close the owned read transport
+        # after cancellation so inherited writers cannot hold Process.wait open.
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            output = transport.get_pipe_transport(1)
+            if output is not None:
+                output.close()
+
     async def cancel(self) -> None:
         process = self.active_process
-        if process is None or process.returncode is not None:
+        if process is None:
             return
-        process.terminate()
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            self._signal_process(process, kill=False)
+            try:
+                await asyncio.wait_for(
+                    self._wait_cleanup(process), timeout=_TERMINATE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                self._signal_process(process, kill=True)
+                self._close_output_pipe(process)
+                try:
+                    await asyncio.wait_for(
+                        self._wait_cleanup(process), timeout=_KILL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    # SIGKILL has been sent; OS reaping may lag, but pipe writers
+                    # must not block a replacement indefinitely.
+                    logger.warning("Timed out awaiting Lake process cleanup after kill")
+        finally:
+            self._close_output_pipe(process)
 
 
 async def _stop_project_clients(ctx: Any, project_path: Path) -> None:

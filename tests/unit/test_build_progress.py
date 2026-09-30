@@ -49,6 +49,7 @@ def build_mocks(tmp_path):
 
     # Build process with stdout
     build_proc = MagicMock()
+    build_proc.pid = None  # This fake subprocess has no owned POSIX session.
     build_proc.returncode = 0
     build_proc.wait = AsyncMock()
 

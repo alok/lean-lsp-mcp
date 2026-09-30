@@ -225,6 +225,18 @@ This MCP server works out-of-the-box without any configuration. However, a few o
 - `LOOGLE_URL`: URL for a self-hosted Loogle instance (default: `https://loogle.lean-lang.org`). Rate limits are skipped when set to a custom backend.
 - `LOOGLE_HEADERS`: JSON object of extra HTTP headers for Loogle requests (e.g. `'{"X-API-Key": "..."}'`).
 
+Cancelling the last request waiting for a coordinated build stops that build. In
+`share` mode, another waiting request keeps the latest build alive. Superseding
+builds wait for the previous build's cleanup before starting.
+
+On POSIX, each Lake command starts in an owned process group. Cancellation sends
+TERM to that group, waits up to 5 seconds, then sends KILL and waits up to 1 more
+second. The output pipe is closed during cancellation so a descendant holding it
+open cannot block cleanup indefinitely. This covers descendants remaining in the
+owned group, including when its leader exits first. Windows cleanup terminates
+only the direct child; descendants that create another process group/session are
+outside this guarantee.
+
 You can also often set these environment variables in your MCP client configuration:
 <details>
 <summary><b>VSCode mcp.json Example</b></summary>
